@@ -13,7 +13,7 @@ from pyrogram.errors import FloodWait
 # تأكد أن API_ID رقم (integer) وليس نص بين علامات تنصيص
 API_ID = 25039908 
 API_HASH = "2b23aae7b7120dca6a0a5ee2cbbbdf4c"
-BOT_TOKEN = "8324347850:AAHtVH5Rkj-qfPfUu7lxAMBQZ8pL2tk_PWc"
+BOT_TOKEN = "8324347850:AAGJSTZfF2nP-GoDp7BYAGYiB4zyQaB_MOo"
 
 # تعريف العميل مع إجبار القيم
 app = Client(
