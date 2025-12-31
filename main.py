@@ -41,7 +41,7 @@ async def start(client, message):
         "أرسل الفصول الآن وسأرتبها لك فوراً، وعندما تنتهي أرسل /merge."
     )
 
-# 2. استقبال الملفات (النسخة السريعة)
+# 1. استقبال الملفات (النسخة المصححة برمجياً)
 @app.on_message(filters.document & filters.private)
 async def handle_pdf(client, message):
     if not message.document.file_name.lower().endswith('.pdf'):
@@ -51,32 +51,34 @@ async def handle_pdf(client, message):
     if user_id not in user_files: user_files[user_id] = []
     if user_id not in user_states: user_states[user_id] = {}
     
-    # --- التعديل السحري للسرعة ---
-    # إضافة مسار وهمي مؤقتاً لتحديث العداد فوراً أمام المستخدم
+    # إضافة مسار وهمي لتحديث العداد فوراً
     temp_placeholder = f"pending_{message.id}"
     user_files[user_id].append(temp_placeholder)
     
     count = len(user_files[user_id])
     status_text = f"📊 تم استلام {count} ملفات حتى الآن...\n\n💡 أرسل /merge عندما تنتهي."
     
-    # تحديث الرسالة فوراً
     msg_id = user_states[user_id].get("status_msg_id")
+
+    # --- الجزء اللي كان فيه الخطأ ---
     if msg_id:
-        try: await client.edit_message_text(message.chat.id, msg_id, status_text)
-    except:
-        new_msg = await message.reply_text(status_text)
-        user_states[user_id]["status_msg_id"] = new_msg.id
+        try:
+            # لازم السطر ده يكون داخل بلوك الـ try ومزاح لليمين
+            await client.edit_message_text(message.chat.id, msg_id, status_text)
+        except Exception:
+            # الـ except لازم تكون تحت الـ try بالظبط
+            new_msg = await message.reply_text(status_text)
+            user_states[user_id]["status_msg_id"] = new_msg.id
     else:
+        # الـ else دي تابعة للـ if (في حالة مفيش رسالة حالة أصلاً)
         new_msg = await message.reply_text(status_text)
         user_states[user_id]["status_msg_id"] = new_msg.id
 
-    # التحميل الفعلي يحصل الآن في الخلفية
+    # كمل باقي عملية التحميل عادي...
     os.makedirs("downloads", exist_ok=True)
     real_path = os.path.join("downloads", f"{user_id}_{message.document.file_name}")
-    
     await message.download(file_name=real_path)
     
-    # استبدال المسار الوهمي بالحقيقي والترتيب
     user_files[user_id].remove(temp_placeholder)
     user_files[user_id].append(real_path)
     user_files[user_id].sort(key=natural_sort_key)
