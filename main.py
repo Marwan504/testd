@@ -4,42 +4,61 @@ import asyncio
 import threading
 import re
 import time
+import subprocess  # مكتبة استدعاء أدوات النظام
 from flask import Flask
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait
 
 # --- الإعدادات الإجبارية ---
-# تأكد أن API_ID رقم (integer) وليس نص بين علامات تنصيص
 API_ID = 25039908 
 API_HASH = "2b23aae7b7120dca6a0a5ee2cbbbdf4c"
 BOT_TOKEN = "8324347850:AAHAeYWIZnOMt7-_GIpHnLyJBL3ifvd_Y_o"
 
-# تعريف العميل مع إجبار القيم
 app = Client(
     "manga_merger_pro",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    plugins=None # لضمان عدم تحميل أي إعدادات خارجية قديمة
+    plugins=None 
 )
 
-# مخازن البيانات
 user_files = {}
 user_states = {}
 user_locks = {}
 
-# 1. دالة الترتيب الذكي (بتوحد الرموز وترتب حسابياً)
+# 1. دالة الترتيب الذكي
 def natural_sort_key(s):
     normalized_name = s.replace('_', '-')
     return [int(text) if text.isdigit() else text.lower()
             for text in re.split('([0-9]+)', normalized_name)]
 
-# دالة شريط التقدم عند الرفع
+# 2. دالة ضغط ملفات PDF باستخدام Ghostscript
+def compress_pdf(input_path, output_path):
+    try:
+        # إعدادات الضغط: /ebook تعطي جودة متوسطة (150 dpi) وحجم ممتاز
+        gs_command = [
+            "gs",
+            "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.4",
+            "-dPDFSETTINGS=/ebook", 
+            "-dNOPAUSE",
+            "-dQUIET",
+            "-dBATCH",
+            f"-sOutputFile={output_path}",
+            input_path
+        ]
+        subprocess.run(gs_command, check=True)
+        return True
+    except Exception as e:
+        print(f"Compression Error: {e}")
+        return False
+
+# دالة شريط التقدم
 def progress_callback(current, total, client, message):
     if total == 0: return
     percent = current * 100 / total
-    if int(percent) % 30 == 0:
+    if int(percent) % 20 == 0: # تحديث كل 20% لتجنب السبام
         bar = '█' * int(10 * current // total) + '░' * (10 - int(10 * current // total))
         try:
             client.loop.create_task(message.edit_text(f"🚀 جاري الرفع للمشتركين...\n|{bar}| {percent:.1f}%"))
@@ -53,7 +72,6 @@ async def start(client, message):
         "2️⃣ بعد الانتهاء، أرسل أمر /merge للدمج."
     )
 
-# 2. استقبال الملفات (نسخة سريعة + قفل أمان لمنع تكرار الرسائل)
 @app.on_message(filters.document & filters.private)
 async def handle_pdf(client, message):
     if not message.document.file_name.lower().endswith('.pdf'):
@@ -64,7 +82,6 @@ async def handle_pdf(client, message):
     if user_id not in user_states: user_states[user_id] = {}
     if user_id not in user_locks: user_locks[user_id] = asyncio.Lock()
     
-    # استخدام قفل الأمان لضمان تحديث رسالة واحدة فقط
     async with user_locks[user_id]:
         temp_placeholder = f"pending_{message.id}"
         user_files[user_id].append(temp_placeholder)
@@ -83,43 +100,39 @@ async def handle_pdf(client, message):
             new_msg = await message.reply_text(status_text)
             user_states[user_id]["status_msg_id"] = new_msg.id
 
-    # التحميل الفعلي في الخلفية
     os.makedirs("downloads", exist_ok=True)
     real_path = os.path.join("downloads", f"{user_id}_{message.document.file_name}")
     await message.download(file_name=real_path)
     
-    # تحديث المسار الحقيقي بعد التحميل داخل القفل
     async with user_locks[user_id]:
         if temp_placeholder in user_files[user_id]:
             user_files[user_id].remove(temp_placeholder)
         user_files[user_id].append(real_path)
         user_files[user_id].sort(key=natural_sort_key)
 
-# 3. أمر الدمج وعرض القائمة المنسقة
 @app.on_message(filters.command("merge") & filters.private)
 async def merge_command(client, message):
     user_id = message.from_user.id
     if user_id not in user_files or len(user_files[user_id]) < 2:
         return await message.reply_text("❌ أرسل ملفين على الأقل أولاً!")
     
-    # حذف رسالة الحالة لتنظيف الشات
     msg_id = user_states.get(user_id, {}).get("status_msg_id")
     if msg_id:
         try: await client.delete_messages(message.chat.id, msg_id)
         except: pass
 
-    # تنسيق عرض القائمة بشكل احترافي
     formatted_list = []
-    # نستبعد أي ملفات لسه بتتحمل (pending)
     valid_files = [f for f in user_files[user_id] if "pending_" not in f]
     
     for i, f in enumerate(valid_files, 1):
         clean_name = os.path.basename(f).split('_', 1)[1]
         formatted_list.append(f"{i}️⃣ `{clean_name}`")
     
-    final_list_text = "\n".join(formatted_list)
+    final_list_text = "\n".join(formatted_list[:50]) # عرض أول 50 فقط لتجنب طول الرسالة
+    if len(valid_files) > 50: final_list_text += "\n... والمزيد."
+
     await message.reply_text(
-        f"📑 **قائمة الفصول المرتبة ({len(valid_files)} فصل):**\n"
+        f"📑 **قائمة الفصول ({len(valid_files)} فصل):**\n"
         f"━━━━━━━━━━━━━━━\n"
         f"{final_list_text}\n"
         f"━━━━━━━━━━━━━━━\n\n"
@@ -128,81 +141,95 @@ async def merge_command(client, message):
     
     user_states[user_id] = {"step": "get_name"}
 
-# 4. معالجة الاسم والوصف والدمج النهائي
 @app.on_message(filters.text & filters.private & ~filters.command(["start", "merge"]))
 async def handle_logic(client, message):
     user_id = message.from_user.id
     state = user_states.get(user_id)
 
-    # حماية من الـ KeyError لو مفيش عملية دمج شغالة
     if not state or "step" not in state:
         return 
 
     if state["step"] == "get_name":
         user_states[user_id]["name"] = message.text.strip()
         user_states[user_id]["step"] = "get_caption"
-        await message.reply_text("🖋️ تمام، أرسل الآن الوصف (Caption) الذي سيظهر تحت الملف:")
+        await message.reply_text("🖋️ تمام، أرسل الآن الوصف (Caption):")
 
     elif state["step"] == "get_caption":
         caption = message.text.strip()
         filename = user_states[user_id]["name"]
         if not filename.lower().endswith(".pdf"): filename += ".pdf"
         
-        status_msg = await message.reply_text("⏳ جاري دمج الملفات الآن... انتظر قليلاً.")
+        status_msg = await message.reply_text("⏳ جاري الدمج والمعالجة... يرجى الانتظار.")
         
+        output_path = os.path.join("downloads", f"final_{user_id}.pdf")
+        compressed_path = os.path.join("downloads", f"compressed_{user_id}.pdf")
+        valid_files = [f for f in user_files[user_id] if "pending_" not in f]
+
         try:
+            # 1. الدمج
             merger = PyPDF2.PdfMerger()
-            valid_files = [f for f in user_files[user_id] if "pending_" not in f]
             for pdf in valid_files:
                 merger.append(pdf)
-            
-            output_path = os.path.join("downloads", f"final_{user_id}.pdf")
             merger.write(output_path)
             merger.close()
 
-            # إرسال الملف النهائي
+            # 2. فحص الحجم والضغط
+            final_file_to_send = output_path
+            file_size_mb = os.path.getsize(output_path) / (1024 * 1024) # تحويل لميجابايت
+
+            # إذا كان الملف أكبر من 200 ميجا، قم بالضغط
+            if file_size_mb > 200:
+                await status_msg.edit_text(f"📉 الملف حجمه {file_size_mb:.1f}MB، جاري ضغطه لتقليل الحجم...")
+                
+                # عملية الضغط
+                success = compress_pdf(output_path, compressed_path)
+                
+                if success:
+                    new_size = os.path.getsize(compressed_path) / (1024 * 1024)
+                    await status_msg.edit_text(f"✅ تم الضغط بنجاح! الحجم الجديد: {new_size:.1f}MB. جاري الرفع...")
+                    final_file_to_send = compressed_path
+                else:
+                    await status_msg.edit_text("⚠️ فشل الضغط، سيتم إرسال الملف الأصلي...")
+            else:
+                 await status_msg.edit_text(f"✅ الحجم مناسب ({file_size_mb:.1f}MB). جاري الرفع...")
+
+            # 3. الإرسال
             await client.send_document(
                 chat_id=message.chat.id,
-                document=output_path,
+                document=final_file_to_send,
                 caption=caption,
-                file_name=filename, # بدون إضافات
+                file_name=filename,
                 progress=progress_callback,
                 progress_args=(client, status_msg)
             )
             
-            await message.reply_text("✅ تم الانتهاء بنجاح! جاهز للنشر في Anime Hub.")
+            await message.reply_text("✅ تم الانتهاء! جاهز للنشر.")
 
-            # تنظيف الذاكرة والملفات
-            for f in valid_files + [output_path]:
+            # 4. التنظيف
+            files_to_remove = valid_files + [output_path, compressed_path]
+            for f in files_to_remove:
                 if os.path.exists(f): os.remove(f)
+            
             user_files.pop(user_id, None)
             user_states.pop(user_id, None)
             user_locks.pop(user_id, None)
             await status_msg.delete()
 
         except Exception as e:
-            await message.reply_text(f"❌ حدث خطأ غير متوقع: {str(e)}")
+            await message.reply_text(f"❌ حدث خطأ: {str(e)}")
+            # تنظيف في حالة الخطأ أيضاً
+            if os.path.exists(output_path): os.remove(output_path)
 
-# --- سيرفر Flask للبقاء حياً ---
+# --- Flask Keep-Alive ---
 web_app = Flask(__name__)
 @web_app.route('/')
-def home(): return "Speed Manga Bot is Active!"
+def home(): return "Speed Manga Bot with Compression is Active!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     web_app.run(host='0.0.0.0', port=port)
 
 if __name__ == "__main__":
-    # تشغيل Flask في Thread منفصل
     threading.Thread(target=run_flask, daemon=True).start()
-    
-    print("🚀 Speed Manga Bot is starting...")
-    
-    try:
-        app.run()
-    except FloodWait as e:
-        print(f"⚠️ سبام تليجرام: انتظر {e.value} ثانية...")
-        time.sleep(e.value)
-        # هنا ممكن تحاول تشغله تاني بعد الانتظار
-    except Exception as e:
-        print(f"❌ خطأ غير متوقع: {str(e)}")
+    print("🚀 Bot Started...")
+    app.run()
