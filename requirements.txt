@@ -2,3 +2,7 @@ pyrogram
 PyPDF2
 flask
 tgcrypto
+Pyrogram
+TgCrypto
+Flask
+PyPDF2
