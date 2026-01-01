@@ -13,7 +13,7 @@ from pyrogram.errors import FloodWait
 # --- الإعدادات الإجبارية ---
 API_ID = 25039908 
 API_HASH = "2b23aae7b7120dca6a0a5ee2cbbbdf4c"
-BOT_TOKEN = "8324347850:AAGYA1mJVjVCi7n4k8lP4dES0ErTIdVqYa8"
+BOT_TOKEN = "8531856638:AAGVGM0tcAXBwUTL-BbDnPjD0j-KOl7aP7Y"
 
 app = Client(
     "manga_merger_pro",
