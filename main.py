@@ -21,7 +21,7 @@ from pypdf import PdfWriter
 # احصل على هذه البيانات من my.telegram.org و @BotFather
 API_ID = "25039908"         # استبدلها بـ API ID الخاص بك
 API_HASH = "2b23aae7b7120dca6a0a5ee2cbbbdf4c"   # استبدلها بـ API Hash الخاص بك
-BOT_TOKEN = "8324347850:AAGYA1mJVjVCi7n4k8lP4dES0ErTIdVqYa8"  # استبدلها بـ Bot Token الخاص بك
+BOT_TOKEN = "8324347850:AAGxU07pcO2Z2amoKhUYUdTRJjVrHG0pYS8"  # استبدلها بـ Bot Token الخاص بك
 
 DOWNLOAD_DIR = "manga_downloads"
 # --- CONFIGURATION END ---
