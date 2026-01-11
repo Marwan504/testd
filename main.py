@@ -1,252 +1,162 @@
 import os
-import shutil
 import asyncio
+import shutil
 import re
-import subprocess
-import logging
-from concurrent.futures import ThreadPoolExecutor
-from flask import Flask
-from threading import Thread
-from pyrogram import Client, filters, enums
+from pyrogram import Client, filters
 from pyrogram.types import Message
-import PyPDF2
+from PyPDF2 import PdfMerger
+from threading import Thread
+from flask import Flask
 
-# --- الإعدادات (غيّرها ببياناتك الجديدة) ---
-API_ID = 25039908  # غيره
-API_HASH = "2b23aae7b7120dca6a0a5ee2cbbbdf4c" # غيره فوراً
-BOT_TOKEN = "8575340109:AAHoWRjoZe3aSELctlu2hYijDNaSZWl6w2U" # غيره فوراً
+# --- ⚠️ بياناتك ⚠️ ---
+# غير هذه البيانات فوراً لأنك نشرتها سابقاً
+API_ID = 25039908  
+API_HASH = "2b23aae7b7120dca6a0a5ee2cbbbdf4c"
+BOT_TOKEN = "8544321667:AAGp8vO6WZh27BAHI2mdaWQyMOgh8Zematc"
 
-# إعداد السجل (Log) لمعرفة الأخطاء بوضوح
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# إنشاء البوت
+app = Client("clean_manga_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-app = Client("speed_manga_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
+# تخزين مؤقت لبيانات المستخدمين
+# الهيكل: { user_id: { 'files': [], 'name': None, 'processing': False } }
+users_db = {}
 
-# إدارة الجلسات
-user_sessions = {}
-# لإنشاء مهام ثقيلة في الخلفية
-executor = ThreadPoolExecutor(max_workers=4)
-
-class UserData:
-    def __init__(self):
-        self.files = []
-        self.step = None
-        self.name = "output"
-        self.status_msg_id = None
-        self.lock = asyncio.Lock()
-
-# --- دوال المعالجة (تعمل في الخلفية لعدم تجميد البوت) ---
-
+# دالة الترتيب (عشان 10 تيجي بعد 9 مش بعد 1)
 def natural_sort_key(s):
-    """ترتيب طبيعي للملفات"""
-    normalized_name = os.path.basename(s).replace('_', '-')
-    return [int(text) if text.isdigit() else text.lower()
-            for text in re.split('([0-9]+)', normalized_name)]
+    base = os.path.basename(s)
+    return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', base)]
 
-def merge_pdfs_sync(file_list, output_path):
-    """دالة الدمج المتزامن"""
+# دالة دمج (تعمل في الخلفية)
+def merge_files_engine(file_list, output_path):
+    merger = PdfMerger()
     try:
-        merger = PyPDF2.PdfMerger()
-        for pdf in file_list:
-            try:
-                merger.append(pdf)
-            except Exception as e:
-                logger.error(f"Error appending {pdf}: {e}")
-                continue
+        for file in file_list:
+            merger.append(file)
         merger.write(output_path)
         merger.close()
         return True
     except Exception as e:
-        logger.error(f"Merge error: {e}")
+        print(f"Error merging: {e}")
         return False
 
-def compress_pdf_sync(input_path, output_path):
-    """دالة الضغط باستخدام Ghostscript"""
-    try:
-        gs_command = [
-            "gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
-            "-dPDFSETTINGS=/ebook", "-dNOPAUSE", "-dQUIET", "-dBATCH",
-            f"-sOutputFile={output_path}", input_path
-        ]
-        # تشغيل الأمر وانتظاره
-        subprocess.run(gs_command, check=True, timeout=300)
-        return True
-    except Exception as e:
-        logger.error(f"Compression error: {e}")
-        return False
+# --- الأوامر ---
 
-# --- أوامر البوت ---
-
-@app.on_message(filters.command("start") & filters.private)
-async def start_handler(client, message):
+@app.on_message(filters.command("start"))
+async def start_msg(client, message):
     uid = message.from_user.id
-    # تنظيف جلسة سابقة إذا وجدت
-    if uid in user_sessions:
-        path = f"downloads/{uid}"
-        if os.path.exists(path):
-            shutil.rmtree(path, ignore_errors=True)
-        del user_sessions[uid]
-        
+    # تنظيف بداية جديد
+    if uid in users_db:
+        shutil.rmtree(f"downloads/{uid}", ignore_errors=True)
+    users_db[uid] = {'files': [], 'processing': False}
+    
     await message.reply_text(
-        "🚀 **بوت تجميع المانجا السريع**\n\n"
-        "1️⃣ أرسل الفصول (PDF) بأي ترتيب.\n"
-        "2️⃣ سأقوم بترتيبها لك.\n"
-        "3️⃣ أرسل /merge عندما تنتهي للدمج.\n\n"
-        "🧹 أرسل /clear لبدء عملية جديدة وحذف الملفات."
+        "👋 **أهلاً بك!**\n\n"
+        "الآن **قم بتوجيه (Forward)** ملفات الـ PDF من أي قناة للبوت.\n"
+        "عندما تنتهي من التوجيه، أرسل كلمة **/done** أو **/merge**.\n\n"
+        "💡 *نصيحة:* حدد الملفات كلها ووجهها مرة واحدة."
     )
 
-@app.on_message(filters.command("clear") & filters.private)
-async def clear_handler(client, message):
-    uid = message.from_user.id
-    if uid in user_sessions:
-        path = f"downloads/{uid}"
-        if os.path.exists(path): shutil.rmtree(path, ignore_errors=True)
-        del user_sessions[uid]
-    await message.reply_text("🗑️ تم حذف الملفات المؤقتة، أرسل ملفات جديدة الآن.")
-
-@app.on_message(filters.document & filters.private)
-async def doc_handler(client, message: Message):
+# استقبال الملفات (المحرك الصامت)
+@app.on_message(filters.document)
+async def handle_docs(client, message):
     if not message.document.file_name.lower().endswith('.pdf'):
-        return await message.reply_text("❌ ملفات PDF فقط!")
+        return # تجاهل أي شيء ليس PDF
 
     uid = message.from_user.id
-    if uid not in user_sessions:
-        user_sessions[uid] = UserData()
     
-    session = user_sessions[uid]
+    # تهيئة المستخدم لو أول مرة يبعت
+    if uid not in users_db:
+        users_db[uid] = {'files': [], 'processing': False}
     
-    async with session.lock: # منع تداخل التعديلات
-        # إنشاء مجلد خاص بالمستخدم
-        user_dir = f"downloads/{uid}"
-        os.makedirs(user_dir, exist_ok=True)
+    if users_db[uid]['processing']:
+        return await message.reply_text("⛔ انتظر، أنا أقوم بعملية دمج حالياً!")
+
+    # تحميل صامت (بدون رسائل) لعدم تعليق البوت
+    try:
+        file_path = f"downloads/{uid}/{message.document.file_name}"
+        # التأكد من المجلد
+        os.makedirs(f"downloads/{uid}", exist_ok=True)
         
-        file_path = os.path.join(user_dir, message.document.file_name)
-        
-        # رسالة مبدئية
-        status_text = "📥 جاري التحميل..."
-        
-        # إدارة رسالة الحالة (حذف القديمة وإرسال جديدة لضمان ظهورها في الأسفل)
-        if session.status_msg_id:
-            try:
-                await client.delete_messages(message.chat.id, session.status_msg_id)
-            except: pass
-        
-        status_msg = await message.reply_text(status_text)
-        session.status_msg_id = status_msg.id
-        
-        # تحميل الملف
         await message.download(file_name=file_path)
-        session.files.append(file_path)
+        users_db[uid]['files'].append(file_path)
         
-        # التحديث النهائي للعداد
-        count = len(session.files)
-        await client.edit_message_text(
-            message.chat.id, 
-            status_msg.id, 
-            f"✅ **تم استلام {count} ملفات.**\n💡 أرسل المزيد أو اضغط /merge"
-        )
+        # لا نرسل رد هنا نهائياً لتسريع التوجيه الجماعي
+        # البوت هيخزن ويسكت
+        
+    except Exception as e:
+        print(f"Failed to download: {e}")
 
-@app.on_message(filters.command("merge") & filters.private)
-async def merge_command(client, message):
+# أمر الإنهاء والدمج
+@app.on_message(filters.command(["merge", "done"]))
+async def start_merging(client, message):
     uid = message.from_user.id
-    if uid not in user_sessions or len(user_sessions[uid].files) < 2:
-        return await message.reply_text("⚠️ يرجى إرسال ملفين PDF على الأقل.")
+    if uid not in users_db or not users_db[uid]['files']:
+        return await message.reply_text("❌ لم تقم بتوجيه أي ملفات لي بعد!")
     
-    user_sessions[uid].step = "ask_name"
-    
-    # فرز الملفات قبل العرض
-    user_sessions[uid].files.sort(key=natural_sort_key)
-    files_count = len(user_sessions[uid].files)
-    
+    count = len(users_db[uid]['files'])
     await message.reply_text(
-        f"📊 **جاهز لدمج {files_count} ملف!**\n\n"
-        "✍️ **أرسل الآن اسم الملف النهائي:**\n"
-        "(مثال: One Piece 100-110)"
+        f"📦 **تم استلام {count} ملف بنجاح.**\n"
+        "📝 **أرسل الآن الاسم الذي تريده للملف النهائي:**"
     )
+    # وضع علامة أننا ننتظر الاسم
+    users_db[uid]['step'] = 'waiting_name'
 
-@app.on_message(filters.text & filters.private & ~filters.command(["start", "merge", "clear"]))
-async def text_handler(client, message):
+# استقبال الاسم وبدء العملية
+@app.on_message(filters.text & ~filters.command(["start", "merge", "done"]))
+async def processing_step(client, message):
     uid = message.from_user.id
-    session = user_sessions.get(uid)
+    user_data = users_db.get(uid)
     
-    if not session or not session.step:
+    if not user_data or user_data.get('step') != 'waiting_name':
         return
 
-    if session.step == "ask_name":
-        session.name = message.text.strip().replace("/", "_")
-        session.step = "processing" # قفل الاستقبال لمنع التكرار
-        
-        status = await message.reply_text("⏳ **جاري التجهيز... الرجاء الانتظار!**\n(يتم الدمج الآن في الخلفية)")
-        
-        # إعداد المسارات
-        user_dir = f"downloads/{uid}"
-        output_pdf = os.path.join(user_dir, f"{session.name}.pdf")
-        
-        # --- العمليات الثقيلة (تشغيل في خيط منفصل لتجنب التعليق) ---
-        loop = asyncio.get_running_loop()
-        
-        # 1. الدمج
-        merge_success = await loop.run_in_executor(executor, merge_pdfs_sync, session.files, output_pdf)
-        
-        if not merge_success:
-            session.step = None
-            return await status.edit_text("❌ فشل دمج الملفات. تأكد أنها سليمة.")
+    # استلام الاسم
+    filename = message.text.strip().replace('/', '-')
+    if not filename.endswith('.pdf'): filename += ".pdf"
+    
+    # قفل المستخدم
+    user_data['processing'] = True
+    user_data['step'] = None # إنهاء الخطوة
+    
+    status_msg = await message.reply_text("⏳ **جاري الترتيب والدمج...**")
 
-        # 2. فحص الحجم
-        file_size_mb = os.path.getsize(output_pdf) / (1024 * 1024)
-        final_path = output_pdf
-        
-        if file_size_mb > 150: # إذا أكبر من 150 ميجا نضغط
-            await status.edit_text(f"📉 الحجم {file_size_mb:.1f}MB، جاري الضغط لتقليل الحجم...")
-            compressed_path = os.path.join(user_dir, f"Compressed_{session.name}.pdf")
-            
-            comp_success = await loop.run_in_executor(executor, compress_pdf_sync, output_pdf, compressed_path)
-            if comp_success:
-                final_path = compressed_path
-                new_size = os.path.getsize(final_path) / (1024 * 1024)
-                await status.edit_text(f"✅ تم الضغط! الحجم الجديد: {new_size:.1f}MB. جاري الرفع...")
-            else:
-                await status.edit_text("⚠️ فشل الضغط، سيتم رفع النسخة الأصلية...")
-        else:
-            await status.edit_text(f"🚀 جاري الرفع ({file_size_mb:.1f}MB)...")
+    # ترتيب الملفات
+    files = sorted(user_data['files'], key=natural_sort_key)
+    output_path = f"downloads/{uid}/{filename}"
+    
+    # تشغيل الدمج في Thread عشان البوت ميهنجش
+    loop = asyncio.get_event_loop()
+    success = await loop.run_in_executor(None, merge_files_engine, files, output_path)
 
-        # 3. الرفع
-        async def progress(current, total):
-             # تحديث فقط كل 5 ثواني أو فوارق كبيرة لمنع التعليق
-             try:
-                if total > 0 and (current / total * 100) % 25 < 1: 
-                     await status.edit_text(f"📤 رفع: {current * 100 / total:.1f}%")
-             except: pass
-
+    if success:
+        await status_msg.edit_text("🚀 **جاري الرفع...**")
         try:
             await client.send_document(
                 chat_id=message.chat.id,
-                document=final_path,
-                caption=f"✅ **{session.name}**",
-                progress=progress
+                document=output_path,
+                caption=f"✅ تم دمج {len(files)} فصل.\n📁 الاسم: {filename}"
             )
-            await status.delete()
-            await message.reply_text("✨ تمت العملية بنجاح!")
+            await status_msg.delete()
         except Exception as e:
-            await message.reply_text(f"❌ حدث خطأ أثناء الرفع: {e}")
-        
-        # 4. تنظيف نهائي
-        shutil.rmtree(user_dir, ignore_errors=True)
-        del user_sessions[uid]
+            await message.reply_text(f"خطأ في الرفع: {e}")
+    else:
+        await status_msg.edit_text("❌ حدث خطأ أثناء دمج الملفات (قد يكون أحد الملفات معطوب).")
 
-# --- تشغيل Flask للريلواي ---
-flask_app = Flask(__name__)
-@flask_app.route('/')
-def ping(): return "Bot Running Fast & Smooth!"
+    # تنظيف
+    shutil.rmtree(f"downloads/{uid}", ignore_errors=True)
+    del users_db[uid]
+
+# --- تشغيل وهمي للسيرفر (عشان الاستضافة) ---
+flask = Flask(__name__)
+@flask.route('/')
+def home(): return "Manga Bot Online"
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
-    flask_app.run(host="0.0.0.0", port=port)
+    flask.run(host='0.0.0.0', port=port)
 
 if __name__ == "__main__":
-    # تشغيل السيرفر في Thread
-    t = Thread(target=run_web, daemon=True)
-    t.start()
-    
-    print("🔥 Bot Started Successfully")
+    # تشغيل السيرفر في الخلفية
+    Thread(target=run_web, daemon=True).start()
+    print("🤖 Bot Started...")
     app.run()
