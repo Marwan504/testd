@@ -20,7 +20,7 @@ from pyrogram.errors import MessageNotModified
 # --- CONFIGURATION ---
 API_ID = "25039908"        # Get from https://my.telegram.org
 API_HASH = "2b23aae7b7120dca6a0a5ee2cbbbdf4c"    # Get from https://my.telegram.org
-BOT_TOKEN = "8198010213:AAFbxC1ICpAeyrDXOyWd0rOz3V8QXZd5mCA"  # Get from @BotFather
+BOT_TOKEN = "8198010213:AAFn-VDbWXkCsxpta1dT7D7yEmIxwzu_kQY"  # Get from @BotFather
 DOWNLOAD_PATH = "downloads"
 
 # Initialize the Bot
