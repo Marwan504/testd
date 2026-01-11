@@ -1,13 +1,12 @@
 import os
-import time
+import re
 import math
+import time
 import shutil
 import asyncio
-import re  # <--- CRITICAL IMPORT
-from typing import Dict, List, Any
-from pypdf import PdfWriter
+from typing import List, Dict, Any
 
-# Pyrogram imports
+# Libraries required: pip install pyrogram tgcrypto pypdf aiofiles
 from pyrogram import Client, filters
 from pyrogram.types import (
     Message, 
@@ -16,299 +15,263 @@ from pyrogram.types import (
     CallbackQuery
 )
 from pyrogram.errors import MessageNotModified
+from pypdf import PdfWriter
 
-# --- CONFIGURATION ---
-API_ID = "25039908"        # Get from https://my.telegram.org
-API_HASH = "2b23aae7b7120dca6a0a5ee2cbbbdf4c"    # Get from https://my.telegram.org
-BOT_TOKEN = "7982699886:AAGmFbm7mfLsZq0uFJWaiEd0JAZm_CVEn9I"  # Get from @BotFather
-DOWNLOAD_PATH = "downloads"
+# --- CONFIGURATION START ---
+# احصل على هذه البيانات من my.telegram.org و @BotFather
+API_ID = "25039908"         # استبدلها بـ API ID الخاص بك
+API_HASH = "2b23aae7b7120dca6a0a5ee2cbbbdf4c"   # استبدلها بـ API Hash الخاص بك
+BOT_TOKEN = "8324347850:AAGYA1mJVjVCi7n4k8lP4dES0ErTIdVqYa8"  # استبدلها بـ Bot Token الخاص بك
 
-# Initialize the Bot
-app = Client(
-    "manga_merger_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN
-)
+DOWNLOAD_DIR = "manga_downloads"
+# --- CONFIGURATION END ---
 
-# --- CLASSES & STATE MANAGEMENT ---
+# تهيئة البوت
+app = Client("ExpertMangaBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-class UserState:
-    IDLE = 0
-    COLLECTING = 1
-    WAITING_FOR_NAME = 2
-    PROCESSING = 3
-
+# --- كلاس إدارة الجلسات (Session Management) ---
 class SessionManager:
-    """Manages temporary data for users in memory."""
     def __init__(self):
-        self._data: Dict[int, Dict[str, Any]] = {}
+        # هيكل البيانات: {user_id: {"status": "idle", "files": [], "output_name": "manga.pdf"}}
+        self.sessions: Dict[int, Dict[str, Any]] = {}
 
-    def get_user_status(self, user_id: int):
-        return self._data.get(user_id, {}).get("status", UserState.IDLE)
-
-    def set_user_status(self, user_id: int, status: int):
-        if user_id not in self._data:
-            self._data[user_id] = {"files": []}
-        self._data[user_id]["status"] = status
+    def get_user_data(self, user_id: int):
+        if user_id not in self.sessions:
+            self.sessions[user_id] = {"status": "idle", "files": [], "output_name": None}
+        return self.sessions[user_id]
 
     def add_file(self, user_id: int, message: Message):
-        if user_id not in self._data:
-            self._data[user_id] = {"files": [], "status": UserState.IDLE}
-        
-        # Prevent duplicates based on file_unique_id
-        current_files = self._data[user_id]["files"]
-        file_id = message.document.file_unique_id
-        
-        if not any(f.document.file_unique_id == file_id for f in current_files):
-            current_files.append(message)
+        user_data = self.get_user_data(user_id)
+        # التحقق من عدم التكرار (Duplicates check)
+        existing_ids = [f.document.file_unique_id for f in user_data["files"]]
+        if message.document.file_unique_id not in existing_ids:
+            user_data["files"].append(message)
             return True
         return False
 
-    def get_files(self, user_id: int) -> List[Message]:
-        return self._data.get(user_id, {}).get("files", [])
+    def clear_session(self, user_id: int):
+        if user_id in self.sessions:
+            del self.sessions[user_id]
+        # تنظيف المجلدات
+        path = os.path.join(DOWNLOAD_DIR, str(user_id))
+        if os.path.exists(path):
+            shutil.rmtree(path, ignore_errors=True)
 
-    def set_output_name(self, user_id: int, name: str):
-        self._data[user_id]["output_name"] = name
+session_manager = SessionManager()
 
-    def clear_user(self, user_id: int):
-        if user_id in self._data:
-            user_path = os.path.join(DOWNLOAD_PATH, str(user_id))
-            if os.path.exists(user_path):
-                shutil.rmtree(user_path, ignore_errors=True)
-            del self._data[user_id]
-
-# Global Session Instance
-session = SessionManager()
-
-# --- HELPER FUNCTIONS ---
-
-def get_chapter_number(message: Message) -> float:
+# --- أدوات الفرز والمنطق (Sorting Engine) ---
+def extract_chapter_number(message: Message) -> float:
     """
-    CRITICAL SORTING LOGIC:
-    Extracts numerical value from filenames specifically matching 'ch<digits>'.
-    
-    Target: 'black_clover_ch201_...' -> returns 201
-    Fallback: 'cover.pdf' -> returns infinity (goes to end)
+    الدالة المسؤولة عن استخراج رقم الفصل للترتيب.
+    الأولوية:
+    1. البحث عن 'ch' أو 'chapter' متبوعاً برقم.
+    2. البحث عن 'vol' متبوعاً برقم.
+    3. استخراج أول رقم يظهر في الملف.
     """
-    filename = message.document.file_name or ""
+    filename = message.document.file_name if message.document.file_name else ""
     
-    # Logic: Look for 'ch' (case insensitive), followed by optional spacer (._- ), then digits.
-    # We match strictly for integers.
-    # Explanation of Regex:
-    # ch       : Literal "ch"
-    # [._-\s]* : Zero or more spacers (like "ch-10", "ch.10", "ch 10", "ch10")
-    # (\d+)    : Capture group for the actual digits
-    match = re.search(r'ch[._-\s]*(\d+)', filename, re.IGNORECASE)
-    
-    if match:
-        try:
-            return int(match.group(1))
-        except ValueError:
-            return float('inf')
-            
-    # If explicit 'ch' isn't found, try finding ANY trailing number as fallback,
-    # or return infinity to push it to the end.
+    # 1. Regex Strong (ch/chapter) - Fixed Range Error here: [\s._-]
+    # يبحث عن ch أو chapter، ويقبل مسافات، نقاط، أو شرطة سفلية كفاصل
+    match_ch = re.search(r'(?:ch|chapter)[\s._-]*(\d+)', filename, re.IGNORECASE)
+    if match_ch:
+        return float(match_ch.group(1))
+
+    # 2. Regex Medium (Vol)
+    match_vol = re.search(r'(?:vol|volume)[\s._-]*(\d+)', filename, re.IGNORECASE)
+    if match_vol:
+        return float(match_vol.group(1)) # Vol usually higher hierarchy, but using logical numbering
+
+    # 3. Regex Weak (Any leading number) - e.g. "001.pdf"
+    match_any = re.search(r'(\d+)', filename)
+    if match_any:
+        return float(match_any.group(1))
+
+    # 4. إذا لم يوجد رقم، يوضع في النهاية (مثل صفحة الحقوق)
     return float('inf')
 
-def format_size(size_bytes: int) -> str:
-    if size_bytes == 0: return "0B"
-    size_name = ("B", "KB", "MB", "GB")
-    i = int(math.floor(math.log(size_bytes, 1024)))
-    p = math.pow(1024, i)
-    s = round(size_bytes / p, 2)
-    return "%s %s" % (s, size_name[i])
+# --- أدوات الواجهة والوقت (Helpers) ---
+def format_size(size: int) -> str:
+    power = 2**10
+    n = 0
+    dic_powerN = {0: ' ', 1: 'K', 2: 'M', 3: 'G'}
+    while size > power:
+        size /= power
+        n += 1
+    return f"{round(size, 2)} {dic_powerN.get(n, '')}B"
 
-def format_time(seconds: int) -> str:
-    return f"{int(seconds // 60)}m {int(seconds % 60)}s"
+def progress_bar_str(current, total):
+    percent = current * 100 / total
+    filled = int(percent / 10)
+    return f"[{'■' * filled}{'□' * (10 - filled)}] {percent:.1f}%"
 
-def make_progress_bar(current, total) -> str:
-    percentage = current * 100 / total
-    completed = int(percentage / 10)
-    bar = "■" * completed + "□" * (10 - completed)
-    return f"[{bar}] {round(percentage, 2)}%"
-
-async def progress_callback(current, total, message: Message, operation: str, filename: str):
+async def fast_progress(current, total, message, text_header, filename):
+    # تحديث الرسالة كل 5 ثوانٍ لتجنب الحظر (FloodWait)
     now = time.time()
-    if not hasattr(message, "last_edit_time"):
-        message.last_edit_time = 0
-
-    if (now - message.last_edit_time) > 3 or current == total:
-        bar = make_progress_bar(current, total)
+    last_update = getattr(message, "last_update", 0)
+    if (now - last_update) > 5 or current == total:
         try:
             await message.edit_text(
-                f"<b>{operation}</b>\n\n"
+                f"{text_header}\n\n"
                 f"📄 <b>File:</b> <code>{filename}</code>\n"
-                f"📊 <b>Progress:</b> {bar}\n"
-                f"💾 <b>Size:</b> {format_size(current)} / {format_size(total)}"
+                f"⏳ <b>Progress:</b> {progress_bar_str(current, total)}\n"
+                f"📊 <b>Size:</b> {format_size(current)} / {format_size(total)}"
             )
-            message.last_edit_time = now
+            message.last_update = now
         except MessageNotModified:
             pass
 
-# --- BOT HANDLERS ---
+# --- HANDLERS (أكواد البوت) ---
 
 @app.on_message(filters.command("start") & filters.private)
-async def start_handler(client: Client, message: Message):
+async def start_msg(client, message):
     user_id = message.from_user.id
-    session.clear_user(user_id) 
-    session.set_user_status(user_id, UserState.COLLECTING)
+    session_manager.clear_session(user_id)
+    session_manager.get_user_data(user_id)["status"] = "collecting"
     
-    txt = (
-        "<b>📚 Manga PDF Merger Bot (Regex Edition)</b>\n\n"
-        "I specialize in handling manga sorting issues (e.g., matching Ch. 202 before Ch. 10).\n\n"
-        "<b>Algorithm:</b>\n"
-        "I extract integers from filenames: <code>...ch201...</code>\n\n"
-        "👇 <b>Action:</b> Forward your PDF chapters now."
+    welcome = (
+        "<b>🛡 Manga Merge Bot Professional</b>\n\n"
+        "أهلاً بك. هذا البوت مخصص لدمج فصول المانجا وترتيبها بذكاء.\n"
+        "✅ <b>يدعم الترتيب الذكي:</b> يفهم أن الفصل 20 يأتي بعد 2 وقبل 100.\n"
+        "✅ <b>نظام التجميع:</b> أرسل الفصول دفعة واحدة (Forward).\n\n"
+        "🚀 <b>للبدء:</b> فقط قم بإعادة توجيه (Forward) ملفات الـ PDF الآن."
     )
-    await message.reply_text(txt)
+    await message.reply_text(welcome)
 
 @app.on_message(filters.document & filters.private)
-async def file_handler(client: Client, message: Message):
+async def receive_files(client, message):
     user_id = message.from_user.id
-    if session.get_user_status(user_id) == UserState.COLLECTING:
-        if message.document.mime_type == "application/pdf":
-            session.add_file(user_id, message)
-            
-            # Simple accumulating reply (avoids button spam if rapid forwarding)
-            files = session.get_files(user_id)
-            count = len(files)
-            
-            # Show "Done" button only periodically or at start to avoid flood
-            btn = InlineKeyboardMarkup([[
-                InlineKeyboardButton(f"✅ PROCESS BATCH ({count})", callback_data="done")
+    data = session_manager.get_user_data(user_id)
+
+    if message.document.mime_type != "application/pdf":
+        return await message.reply("❌ عذراً، أقبل ملفات PDF فقط.", quote=True)
+
+    if data["status"] == "collecting":
+        is_new = session_manager.add_file(user_id, message)
+        if is_new:
+            files_count = len(data["files"])
+            # لوحة تحكم تظهر مرة واحدة أو تتحدث
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton(f"📥 بدء المعالجة ({files_count})", callback_data="start_processing")
             ]])
             
             await message.reply_text(
-                f"📥 <b>Received:</b> <code>{message.document.file_name}</code>\n"
-                f"🗃 <b>Queue:</b> {count} files detected.",
-                quote=True,
-                reply_markup=btn
+                f"✅ تم إضافة: <code>{message.document.file_name}</code>\n"
+                f"🔢 العدد الكلي: {files_count}",
+                reply_markup=kb,
+                quote=True
             )
-    else:
-        # Ignore if processing
-        pass
 
-@app.on_callback_query(filters.regex("done"))
-async def finish_collection(client: Client, callback: CallbackQuery):
+@app.on_callback_query(filters.regex("start_processing"))
+async def process_button(client, callback):
     user_id = callback.from_user.id
-    files = session.get_files(user_id)
-    if not files:
-        return await callback.answer("Empty queue!", show_alert=True)
+    data = session_manager.get_user_data(user_id)
     
-    session.set_user_status(user_id, UserState.WAITING_FOR_NAME)
+    if not data["files"]:
+        return await callback.answer("القائمة فارغة!", show_alert=True)
+        
+    data["status"] = "naming"
     await callback.message.edit_text(
-        f"✅ <b>Processing {len(files)} Chapters</b>\n\n"
-        "Please reply with the desired <b>filename</b> (e.g., <i>Black Clover Vol 1</i>)."
+        "📝 <b>خطوة أخيرة:</b>\n\n"
+        "أرسل لي الآن <b>اسم الملف النهائي</b> الذي تريده.\n"
+        "مثال: <code>One Piece Vol 100</code>"
     )
 
 @app.on_message(filters.text & filters.private)
-async def filename_handler(client: Client, message: Message):
+async def final_execution(client, message):
     user_id = message.from_user.id
-    if session.get_user_status(user_id) != UserState.WAITING_FOR_NAME:
+    data = session_manager.get_user_data(user_id)
+    
+    if data["status"] != "naming":
         return
 
-    # Clean Name
-    user_input = message.text.strip()
-    safe_name = re.sub(r'[\\/*?:"<>|]', "", user_input).replace(" ", "_")
-    if not safe_name.lower().endswith(".pdf"):
-        safe_name += ".pdf"
-
-    session.set_output_name(user_id, safe_name)
-    session.set_user_status(user_id, UserState.PROCESSING)
+    # 1. إعداد الاسم والمجلد
+    out_name = re.sub(r'[\\/*?:"<>|]', "", message.text).strip()
+    if not out_name.lower().endswith(".pdf"):
+        out_name += ".pdf"
     
-    await process_pdfs(client, message)
-
-# --- CORE LOGIC WITH REGEX SORTING ---
-
-async def process_pdfs(client: Client, message: Message):
-    user_id = message.from_user.id
-    files = session.get_files(user_id)
-    output_name = session._data[user_id]["output_name"]
+    data["status"] = "working"
+    status_msg = await message.reply_text("⚙️ <b>جاري تحليل الفصول وترتيبها...</b>")
     
-    status_msg = await message.reply_text("🧮 <b>Analyzing Chapter Numbers...</b>")
+    user_dir = os.path.join(DOWNLOAD_DIR, str(user_id))
+    os.makedirs(user_dir, exist_ok=True)
     
     try:
-        # --- CRITICAL: APPLIED REGEX SORTING ---
-        # We sort the Pyrogram Message objects directly based on filename integers
-        # files = [MessageObject, MessageObject...]
+        # 2. الفرز (Sorting) - Critical Step
+        # نقوم بفرز كائنات الرسائل قبل التحميل بناءً على الأرقام
+        sorted_files = sorted(data["files"], key=extract_chapter_number)
         
-        # Sort logic: Extracts integer from "ch<int>", returns infinity if failed
-        sorted_files = sorted(files, key=get_chapter_number)
-        
-        # Verify Sort for User (Optional: print first/last to logs)
-        print(f"User {user_id} sorted: {[f.document.file_name for f in sorted_files]}")
-
-        # Directory Setup
-        user_path = os.path.join(DOWNLOAD_PATH, str(user_id))
-        os.makedirs(user_path, exist_ok=True)
-        downloaded_paths = []
-
+        # قائمة للاحتفاظ بمسارات الملفات التي تم تحميلها
+        local_pdf_paths = []
         start_time = time.time()
         
-        # --- DOWNLOADING SORTED FILES ---
-        total = len(sorted_files)
-        for i, msg in enumerate(sorted_files, 1):
-            fname = msg.document.file_name
-            await status_msg.edit_text(
-                f"⬇️ <b>Downloading Sequence {i}/{total}</b>\n\n"
-                f"📖 <b>Chapter:</b> {get_chapter_number(msg)}\n"
-                f"📄 <b>File:</b> <code>{fname}</code>"
-            )
+        # 3. التحميل (Downloading)
+        total_files = len(sorted_files)
+        for idx, msg in enumerate(sorted_files, 1):
+            f_name = msg.document.file_name
+            chapter_num = extract_chapter_number(msg)
             
-            path = await client.download_media(msg, os.path.join(user_path, fname))
-            downloaded_paths.append(path)
-
-        # --- MERGING ---
-        await status_msg.edit_text("⚙️ <b>Merging Files (CPU Task)...</b>")
-        output_path = os.path.join(user_path, output_name)
-        
-        # Blocking call pushed to thread
-        await asyncio.to_thread(merge_files_blocking, downloaded_paths, output_path)
-
-        # --- UPLOADING ---
-        await status_msg.edit_text("☁️ <b>Uploading Final Volume...</b>")
-        
-        final_size = os.path.getsize(output_path)
-        proc_time = time.time() - start_time
-        
-        async def up_prog(cur, tot):
-            await progress_callback(cur, tot, status_msg, "🚀 Uploading", output_name)
+            await fast_progress(0, 100, status_msg, 
+                f"⬇️ <b>Downloading ({idx}/{total_files})</b>\nDetect: Ch {chapter_num}", f_name)
             
+            # حفظ الملف بنفس الاسم الأصلي لسهولة التتبع
+            file_path = os.path.join(user_dir, f"{idx}_{f_name}")
+            await client.download_media(msg, file_path)
+            local_pdf_paths.append(file_path)
+
+        # 4. الدمج (Merging) - Blocking Operation
+        await status_msg.edit_text(f"🔄 <b>يتم الآن دمج {total_files} فصلاً...</b>\n⚠️ انتظر قليلاً...")
+        
+        merged_path = os.path.join(user_dir, out_name)
+        
+        # تشغيل الدمج في Thread خارجي حتى لا يتوقف البوت
+        await asyncio.to_thread(perform_merge, local_pdf_paths, merged_path)
+        
+        # 5. الرفع (Uploading)
+        final_size = os.path.getsize(merged_path)
+        process_time = time.time() - start_time
+        
+        await status_msg.edit_text("☁️ <b>جاري رفع الملف النهائي...</b>")
+        
         caption = (
-            f"✅ <b>Manga Volume Ready</b>\n\n"
-            f"📛 <b>Name:</b> {output_name}\n"
-            f"🗃 <b>Chapters:</b> {total} (Sorted 1 → {total})\n"
-            f"💾 <b>Size:</b> {format_size(final_size)}\n"
-            f"⏱ <b>Time:</b> {format_time(proc_time)}"
+            f"📦 <b>{out_name}</b>\n\n"
+            f"📄 الفصول: {total_files}\n"
+            f"📏 الحجم: {format_size(final_size)}\n"
+            f"⏱ الوقت: {int(process_time)} ثانية"
         )
+        
+        async def upload_cb(curr, tot):
+            await fast_progress(curr, tot, status_msg, "🚀 Uploading Final PDF", out_name)
 
         await client.send_document(
             user_id,
-            document=output_path,
+            document=merged_path,
             caption=caption,
-            progress=up_prog
+            progress=upload_cb
         )
         
         await status_msg.delete()
+        await message.reply_text("✅ <b>تمت العملية بنجاح!</b> \nأرسل /start لبدء عملية جديدة.")
 
     except Exception as e:
-        await status_msg.edit_text(f"❌ <b>Error:</b> {str(e)}")
-        raise e # Log in console
+        await message.reply_text(f"❌ حدث خطأ غير متوقع:\n<code>{e}</code>")
+        print(e)
     finally:
-        session.clear_user(user_id)
+        session_manager.clear_session(user_id)
 
-def merge_files_blocking(inputs: List[str], output: str):
-    """Worker function for merging."""
+# دالة الدمج المستقلة
+def perform_merge(files_list, output_path):
     merger = PdfWriter()
-    for f in inputs:
-        # Strict mode=False handles slightly broken Manga PDFs better
-        merger.append(f) 
-    merger.write(output)
+    for pdf in files_list:
+        try:
+            merger.append(pdf)
+        except Exception:
+            pass # Skip corrupted files if needed
+    merger.write(output_path)
     merger.close()
 
+# نقطة الانطلاق
 if __name__ == "__main__":
-    if not os.path.exists(DOWNLOAD_PATH):
-        os.makedirs(DOWNLOAD_PATH)
-    print("Bot is Alive. Sort Logic: regex('ch(\\d+)')")
+    if not os.path.exists(DOWNLOAD_DIR):
+        os.makedirs(DOWNLOAD_DIR)
+    print("Bot is Running Cleanly...")
     app.run()
